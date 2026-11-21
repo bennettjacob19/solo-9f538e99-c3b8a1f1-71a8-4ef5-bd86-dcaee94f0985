@@ -15,12 +15,33 @@ up. This service therefore cannot decide on the first span:
    distinct spans per trace.
 3. When the window closes the trace is decided:
    - **no ERROR span → dropped**, the slot is released immediately;
-   - **at least one ERROR span → the entire trace is written to SQLite** in one
-     transaction, and the slot is released only after the commit succeeds.
-4. Spans for a trace whose window has closed are rejected, even if the trace is
+   - **at least one ERROR span → the entire trace is queued for SQLite** and
+     the slot is released only after a commit containing it succeeds.
+4. Pending error traces are archived in **batches of at most 8 per SQLite
+   transaction**. A batch is taken from traces that have not been attempted yet
+   or whose retry time has arrived, and a short batch is written immediately
+   rather than waiting for eight. This keeps archive commits proportional to
+   load instead of one commit per trace.
+5. Spans for a trace whose window has closed are rejected, even if the trace is
    still waiting to be written.
-5. At 16 occupied slots only *new* trace ids are refused; traces already
+6. At 16 occupied slots only *new* trace ids are refused; traces already
    admitted keep collecting until their own window closes.
+
+Each trace inside a batch is written under its own SQLite savepoint, so per-trace
+faults are contained: if one trace's data is rejected, only that trace is rolled
+back. Its previous archive (if any) and its pending snapshot are kept, it is
+retried with the same exponential backoff as any other write failure, and the
+other traces in the batch commit normally. If the batch transaction itself
+cannot be committed, nothing from the batch becomes visible: every trace in it
+stays pending, keeps its slot, and is retried later. The SQLite durability
+settings are unchanged (`journal_mode = WAL`, `synchronous = FULL`).
+
+The overview page reports two counters for the current process: **Archived this
+run** (`traces_archived`, one per committed trace) and **Archive commits**
+(`archive_commits`, one per successful batch transaction). With archiving
+paused, eight error traces fed through `/v1/traces`, and then resumed with no
+failures, archived traces increase by 8 and commit transactions by 1; both
+counters are also exposed in `GET /api/status` under `totals`.
 
 Slots count both open traces and error traces that have expired but not yet
 been committed, so the number of traces occupying the budget never exceeds the
@@ -50,8 +71,10 @@ Archiving can be paused from the page or via `POST /api/archive/pause`. Traces
 that expire while paused keep exactly the spans they held at expiry (later spans
 are still refused), stay in memory, and stay invisible on the page. When
 archiving resumes — or when a failed SQLite write later succeeds — every pending
-trace is written automatically. Write failures use exponential backoff (max
-30s) and never lose the expired content.
+trace is written automatically in batches. Write failures use exponential
+backoff (max 30s) and never lose the expired content. A background write and
+the inline write triggered by the resume button coordinate through a per-trace
+in-progress marker, so the same pending trace is never archived twice.
 
 ## Run with Docker Compose
 
@@ -122,7 +145,7 @@ Only OTLP/HTTP JSON is decoded; protobuf exports receive HTTP 415.
 ```
 app/otlp.py      OTLP/HTTP JSON parsing and response shaping
 app/sampler.py   window/slot state machine, dedupe, cap, pause, retry
-app/storage.py   transactional SQLite archive
+app/storage.py   transactional SQLite archive (batched, per-trace savepoints)
 app/main.py      FastAPI app factory, routes, templates
 tests/           sampler unit tests and HTTP-level tests
 ```

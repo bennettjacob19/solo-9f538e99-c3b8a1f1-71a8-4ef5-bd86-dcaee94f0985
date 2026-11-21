@@ -17,6 +17,13 @@ Rules implemented here:
 * Archiving can be paused.  Paused or failed writes keep the pending trace
   exactly as it was at expiry and are retried automatically once archiving is
   resumed (or a later attempt succeeds).
+* Pending traces are committed in batches of at most ``ARCHIVE_BATCH_SIZE`` in
+  a single SQLite transaction.  A batch is selected from traces that have never
+  been attempted or whose retry time has arrived; a short batch is written
+  immediately rather than waiting for the cap to fill.  A trace whose own data
+  is rejected by SQLite is kept (with any earlier archive) and retried on the
+  normal backoff schedule, while the rest of its batch commits normally.  If
+  the batch transaction itself fails, no trace in it is released.
 """
 
 from __future__ import annotations
@@ -41,6 +48,10 @@ DEFAULT_MAX_SPANS = 64
 # by both time and entry count to keep memory finite under load.
 CLOSED_RETENTION_SECONDS = float(os.environ.get("CLOSED_TRACE_RETENTION", "300"))
 CLOSED_MEMORY = int(os.environ.get("CLOSED_TRACE_MEMORY", "200000"))
+# Pending error traces are committed in batches one SQLite transaction per
+# batch.  The cap keeps a single transaction small and bounds how long one
+# archive commit holds the database lock.
+ARCHIVE_BATCH_SIZE = 8
 
 
 class TraceSampler:
@@ -88,6 +99,9 @@ class TraceSampler:
             "traces_archived": 0,
             "traces_write_failed": 0,
             "traces_capacity_rejected": 0,
+            # Successful commits of an archive batch.  This is what "archived
+            # traces" counts must be compared against to see batching work.
+            "archive_commits": 0,
         }
         self.last_error: Optional[str] = None
 
@@ -243,7 +257,7 @@ class TraceSampler:
                 self.totals["traces_discarded"] += 1
                 continue
             # Keep the expired snapshot and, with it, the slot.  The slot is
-            # freed only when ArchiveStore.write_trace commits.
+            # freed only when a batch containing this trace commits.
             spans = sorted(trace.spans.values(), key=lambda s: (s.seq, s.span_id))
             self._pending[trace_id] = PendingArchive(
                 trace_id=trace_id, spans=spans, expired_at=now
@@ -261,7 +275,13 @@ class TraceSampler:
             )
 
     def tick(self) -> None:
-        """Expire open traces and flush pending archives that are due."""
+        """Expire open traces and flush pending archives that are due.
+
+        Due pending traces are written in batches of at most
+        ``ARCHIVE_BATCH_SIZE``.  Each batch is reserved under the lock before
+        its write starts, so a background tick and the inline tick triggered by
+        the resume page can never pick the same pending trace twice.
+        """
 
         with self._lock:
             self._expire_locked(self.clock())
@@ -276,45 +296,95 @@ class TraceSampler:
                     for trace_id, item in self._pending.items()
                     if self._next_attempt.get(trace_id, 0.0) <= now
                     and trace_id not in self._writing
-                ]
+                ][:ARCHIVE_BATCH_SIZE]
                 for item in due:
                     self._writing.add(item.trace_id)
             if not due:
                 break
-            for item in due:
-                try:
-                    # Stop early if archiving was paused between writes.
-                    if self._paused:
-                        break
-                    self._write_pending(item)
-                finally:
-                    with self._lock:
+            # Stop early if archiving was paused between batches.
+            if self._paused:
+                with self._lock:
+                    for item in due:
+                        self._writing.discard(item.trace_id)
+                break
+            try:
+                self._write_pending(due)
+            finally:
+                with self._lock:
+                    for item in due:
                         self._writing.discard(item.trace_id)
 
-    def _write_pending(self, item: PendingArchive) -> None:
+    def _write_pending(self, items: list[PendingArchive]) -> None:
+        """Commit one batch; each trace is released only after the commit."""
+
         try:
-            self.store.write_trace(item.trace_id, item.spans)
+            result = self.store.write_batch(
+                [(item.trace_id, item.spans) for item in items]
+            )
         except Exception as exc:
-            with self._lock:
-                item.attempts += 1
-                item.last_error = f"{type(exc).__name__}: {exc}"
-                self.last_error = item.last_error
-                self.totals["traces_write_failed"] += 1
-                delay = min(30.0, max(0.5, self._retry_delay.get(item.trace_id, 0.0) * 2))
-                self._retry_delay[item.trace_id] = delay
-                self._next_attempt[item.trace_id] = self.clock() + delay
-            log.warning("archive write failed for %s: %s", item.trace_id, exc)
+            self._handle_batch_failure(items, exc)
             return
 
+        # The batch transaction committed.  Traces that failed on their own
+        # data are retried with the normal backoff; the rest are released.
         with self._lock:
-            # Commit succeeded: now the slot can be released.
-            if self._pending.get(item.trace_id) is item:
-                del self._pending[item.trace_id]
-            self._next_attempt.pop(item.trace_id, None)
-            self._retry_delay.pop(item.trace_id, None)
-            self._mark_closed_locked(item.trace_id, self.clock())
-            self.totals["traces_archived"] += 1
-        log.info("archived trace %s (%d spans)", item.trace_id, len(item.spans))
+            if result.commits:
+                self.totals["archive_commits"] += result.commits
+            for item in items:
+                error = result.failed.get(item.trace_id)
+                if error is not None:
+                    self._record_write_failure_locked(item, error)
+                else:
+                    self._release_locked(item)
+        for item in items:
+            error = result.failed.get(item.trace_id)
+            if error is not None:
+                log.warning(
+                    "archive rejected trace %s, will retry: %s",
+                    item.trace_id,
+                    error,
+                )
+            else:
+                log.info(
+                    "archived trace %s (%d spans) in a batch of %d",
+                    item.trace_id,
+                    len(item.spans),
+                    len(items),
+                )
+
+    def _handle_batch_failure(
+        self, items: list[PendingArchive], exc: Exception
+    ) -> None:
+        """The whole transaction failed: keep every trace and retry later."""
+
+        error = f"{type(exc).__name__}: {exc}"
+        with self._lock:
+            for item in items:
+                self._record_write_failure_locked(item, error)
+        log.warning(
+            "archive batch of %d trace(s) failed entirely: %s", len(items), error
+        )
+
+    def _record_write_failure_locked(
+        self, item: PendingArchive, error: str
+    ) -> None:
+        item.attempts += 1
+        item.last_error = error
+        self.last_error = error
+        self.totals["traces_write_failed"] += 1
+        delay = min(30.0, max(0.5, self._retry_delay.get(item.trace_id, 0.0) * 2))
+        self._retry_delay[item.trace_id] = delay
+        self._next_attempt[item.trace_id] = self.clock() + delay
+
+    def _release_locked(self, item: PendingArchive) -> None:
+        """A committed trace no longer occupies a slot or waits for retry."""
+
+        if self._pending.get(item.trace_id) is item:
+            del self._pending[item.trace_id]
+        self._next_attempt.pop(item.trace_id, None)
+        self._retry_delay.pop(item.trace_id, None)
+        self._mark_closed_locked(item.trace_id, self.clock())
+        self.totals["traces_archived"] += 1
 
     # ----------------------------------------------------------------- stats
     def snapshot(self) -> dict:

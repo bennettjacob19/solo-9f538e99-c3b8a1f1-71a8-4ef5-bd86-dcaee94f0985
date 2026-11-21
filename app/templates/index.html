@@ -1,7 +1,12 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="grid">
-  <div class="card"><div class="label">Archived traces</div><div class="value">{{ total }}</div></div>
+  <div class="card"><div class="label">Archived traces</div><div class="value">{{ total }}</div>
+    <div class="small muted">all time</div></div>
+  <div class="card"><div class="label">Archived this run</div><div class="value">{{ status.totals.traces_archived }}</div>
+    <div class="small muted">traces committed since start</div></div>
+  <div class="card"><div class="label">Archive commits</div><div class="value">{{ status.totals.archive_commits }}</div>
+    <div class="small muted">successful batch transactions</div></div>
   <div class="card"><div class="label">Slots in use</div><div class="value">{{ status.slotsUsed }} / {{ status.capacity }}</div>
     <div class="small muted">{{ status.activeTraces|length }} collecting · {{ status.pendingTraces|length }} awaiting write</div></div>
   <div class="card"><div class="label">Spans accepted</div><div class="value">{{ status.totals.spans_accepted }}</div>

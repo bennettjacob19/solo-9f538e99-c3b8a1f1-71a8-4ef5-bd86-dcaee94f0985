@@ -291,6 +291,40 @@ def test_malformed_payload_returns_400(client):
     assert response.status_code == 400
 
 
+def test_pause_then_eight_error_traces_archive_in_one_commit(client, clock):
+    """The acceptance scenario: pause, ingest eight error traces, close the
+    windows, resume.  Eight traces are archived and only one transaction is
+    committed."""
+
+    client.post("/pause")
+    traces = [tid(1000 + i) for i in range(8)]
+    for trace in traces:
+        response = post(
+            client, [{"trace": trace, "span": sid(1), "name": "op", "error": True}]
+        )
+        assert response.status_code == 200
+
+    close_window(client, clock)
+    paused_status = client.get("/api/status").json()
+    assert paused_status["archivedTraces"] == 0
+    assert len(paused_status["pendingTraces"]) == 8
+    assert paused_status["totals"]["traces_archived"] == 0
+    assert paused_status["totals"]["archive_commits"] == 0
+
+    client.post("/resume")
+    status = client.get("/api/status").json()
+    assert status["archivedTraces"] == 8
+    assert status["pendingTraces"] == []
+    assert status["totals"]["traces_archived"] == 8
+    assert status["totals"]["archive_commits"] == 1
+
+    page = client.get("/")
+    assert "Archived this run" in page.text
+    assert "Archive commits" in page.text
+    for trace in traces:
+        assert client.get(f"/api/traces/{trace}").status_code == 200
+
+
 def test_invalid_span_ids_are_rejected_but_valid_ones_kept(client, clock):
     trace = tid(9)
     payload = otlp_payload([{"trace": trace, "span": sid(1), "error": True}])
